@@ -138,6 +138,7 @@ private:
     std::string           mCurrentQueryTarget;
     Address               mCurrentQueryAddr;
     uint16_t              mCurrentQueryRloc16 = 0xFFFF;
+    bool                   mCurrentQueryIsSleepy = false;
     std::vector<uint64_t> mPendingChunks;
     size_t                mCurrentChunkIndex;
     int                   mRetryCount;

@@ -230,11 +230,16 @@ void NetworkTraverser::QueryChunk()
     if (mState == State::kQueryingChildren)
     {
         // is it sleepy?
-        if (mChildrenToQuery.count(mCurrentQueryRloc16) && mChildrenToQuery.at(mCurrentQueryRloc16))
+        if (mCurrentQueryIsSleepy)
         {
             timeoutMs = kSleepyTimeoutMs;
         }
     }
+
+    LOG_INFO(LOG_REGION_MESHDIAG,
+             "Querying {} RLOC16 0x{:04X}, sleepy={}, chunk {}/{}, retry {}, timeout={}ms, flags=0x{:X}",
+             mState == State::kQueryingChildren ? "child" : "router", mCurrentQueryRloc16,
+             mCurrentQueryIsSleepy, mCurrentChunkIndex + 1, mPendingChunks.size(), mRetryCount, timeoutMs, chunk);
 
     mRequestTimeoutTimer.Start(std::chrono::milliseconds(timeoutMs));
 }
@@ -242,6 +247,10 @@ void NetworkTraverser::QueryChunk()
 void NetworkTraverser::HandleTimer(Timer &aTimer)
 {
     (void)aTimer;
+    LOG_WARN(LOG_REGION_MESHDIAG,
+             "Diagnostic query timed out for RLOC16 0x{:04X}, child={}, sleepy={}, chunk {}/{}, retry {}/{}",
+             mCurrentQueryRloc16, mState == State::kQueryingChildren, mCurrentQueryIsSleepy,
+             mCurrentChunkIndex + 1, mPendingChunks.size(), mRetryCount, kMaxRetries);
     if (mRetryCount < kMaxRetries)
     {
         mRetryCount++;
@@ -366,6 +375,14 @@ void NetworkTraverser::OnDiagGetAnswer(const std::string &aPeerAddr, const NetDi
 
     uint64_t requested = mPendingChunks[mCurrentChunkIndex];
 
+    if (mState == State::kQueryingChildren)
+    {
+        LOG_INFO(LOG_REGION_MESHDIAG,
+                 "Child response from {} for RLOC16 0x{:04X}, chunk {}/{}, requested flags=0x{:X}, received flags=0x{:X}",
+                 aPeerAddr, mCurrentQueryRloc16, mCurrentChunkIndex + 1, mPendingChunks.size(), requested,
+                 aDiagAnsMsg.mPresentFlags);
+    }
+
     if (requested & NetDiagData::kNetworkDataBit)
     {
         LOG_INFO(LOG_REGION_MESHDIAG, "OnDiagGetAnswer: Expecting Network Data. Recv Flags: 0x{:X}",
@@ -381,6 +398,12 @@ void NetworkTraverser::OnDiagGetAnswer(const std::string &aPeerAddr, const NetDi
     }
     if ((aDiagAnsMsg.mPresentFlags & requested) == 0)
     {
+        if (mState == State::kQueryingChildren)
+        {
+            LOG_WARN(LOG_REGION_MESHDIAG,
+                     "Ignoring child response for RLOC16 0x{:04X}: none of the requested flags were present",
+                     mCurrentQueryRloc16);
+        }
         return;
     }
 
@@ -397,6 +420,9 @@ void NetworkTraverser::OnDiagGetAnswer(const std::string &aPeerAddr, const NetDi
     {
         if ((aDiagAnsMsg.mPresentFlags & NetDiagData::kMacAddrBit) && (aDiagAnsMsg.mMacAddr != mCurrentQueryRloc16))
         {
+            LOG_WARN(LOG_REGION_MESHDIAG,
+                     "Ignoring child response from {}: returned RLOC16 0x{:04X} does not match target 0x{:04X}",
+                     aPeerAddr, aDiagAnsMsg.mMacAddr, mCurrentQueryRloc16);
             return;
         }
     }
@@ -517,10 +543,21 @@ void NetworkTraverser::FinalizeNode()
         // Add leader's children
         if (leaderRloc16 != 0xFFFF && (leaderData.mPresentFlags & NetDiagData::kChildTableBit))
         {
+            LOG_INFO(LOG_REGION_MESHDIAG, "Leader RLOC16 0x{:04X} reported {} children",
+                     leaderRloc16, leaderData.mChildTable.size());
             for (const auto &childEntry : leaderData.mChildTable)
             {
-                mChildrenToQuery[leaderRloc16 | childEntry.mChildId] = !childEntry.mModeData.mIsRxOnWhenIdleMode;
+                uint16_t childRloc16 = leaderRloc16 | childEntry.mChildId;
+                bool     isSleepy    = !childEntry.mModeData.mIsRxOnWhenIdleMode;
+                mChildrenToQuery[childRloc16] = isSleepy;
+                LOG_INFO(LOG_REGION_MESHDIAG, "Queued child RLOC16 0x{:04X}, sleepy={}", childRloc16, isSleepy);
             }
+        }
+        else
+        {
+            LOG_WARN(LOG_REGION_MESHDIAG,
+                     "Leader RLOC16 0x{:04X} did not provide a Child Table; its children cannot be queried",
+                     leaderRloc16);
         }
 
         mState = State::kQueryingRouters;
@@ -583,11 +620,21 @@ void NetworkTraverser::FinalizeNode()
             {
                 if (pair.second.mPresentFlags & NetDiagData::kChildTableBit)
                 {
+                    LOG_INFO(LOG_REGION_MESHDIAG, "Router RLOC16 0x{:04X} reported {} children", rloc16,
+                             pair.second.mChildTable.size());
                     for (const auto &childEntry : pair.second.mChildTable)
                     {
                         // RLOC16 -> isSleepy
-                        mChildrenToQuery[rloc16 | childEntry.mChildId] = !childEntry.mModeData.mIsRxOnWhenIdleMode;
+                        uint16_t childRloc16 = rloc16 | childEntry.mChildId;
+                        bool     isSleepy    = !childEntry.mModeData.mIsRxOnWhenIdleMode;
+                        mChildrenToQuery[childRloc16] = isSleepy;
+                        LOG_INFO(LOG_REGION_MESHDIAG, "Queued child RLOC16 0x{:04X}, sleepy={}", childRloc16,
+                                 isSleepy);
                     }
+                }
+                else
+                {
+                    LOG_WARN(LOG_REGION_MESHDIAG, "Router RLOC16 0x{:04X} did not provide a Child Table", rloc16);
                 }
                 break;
             }
@@ -617,6 +664,7 @@ void NetworkTraverser::FinalizeNode()
 
         mCurrentQueryTarget = addr.ToString();
         mCurrentQueryRloc16 = routerRloc;
+        mCurrentQueryIsSleepy = false;
         mPendingChunks      = kRouterChunks;
         mCurrentChunkIndex  = 0;
         mRetryCount         = 0;
@@ -633,7 +681,7 @@ void NetworkTraverser::FinalizeNode()
 
         auto     it          = mChildrenToQuery.begin();
         uint16_t childRloc16 = it->first;
-        // bool isSleepy = it->second;
+        mCurrentQueryIsSleepy = it->second;
         mChildrenToQuery.erase(it);
 
         const Address addr = GetMeshLocalAddress(childRloc16);
